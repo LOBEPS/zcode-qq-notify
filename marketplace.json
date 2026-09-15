@@ -1,0 +1,20 @@
+{
+  "name": "qq-notify-marketplace",
+  "description": "qq-notify：ZCode 任务完成 QQ 通知插件 / QQ notification plugin for ZCode",
+  "owner": {
+    "name": "LOBEPS"
+  },
+  "plugins": [
+    {
+      "name": "qq-notify",
+      "source": "./qq-notify",
+      "description": "Notify QQ via Qmsg when a ZCode turn completes (>= threshold seconds). 任务完成时通过 Qmsg 酱给你的 QQ 发私聊通知。",
+      "version": "1.0.0",
+      "author": {
+        "name": "lenovo"
+      },
+      "category": "productivity",
+      "keywords": ["qq", "notify", "hooks", "qmsg"]
+    }
+  ]
+}
