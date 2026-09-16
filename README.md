@@ -93,6 +93,7 @@ git clone https://github.com/<你的用户名>/zcode-qq-notify.git
 - hook 注册在会话启动时快照：安装/卸载/更新插件后需要新会话（或重启 ZCode）才生效；但 `config.json` 的 key/阈值是每次触发时读取的，改完即生效
 - ZCode 桌面版默认工作区拿不到真实项目名，通知中以「任务：prompt 摘录」标识来源
 - Qmsg 酱限流：同一 key 每 5 秒 1 条、每日 500 条
+- **只通知成功完成的回合**：回合因错误中断（如模型流断开、网络抖动）时 ZCode 不触发 Stop 事件，不会有通知——这是设计使然，"失败了"和"完成了"应当区分
 - ⚠️ 不要把真实 API Key 提交到任何公开仓库；建议用 `QMSG_KEY` 环境变量
 
 ## License
