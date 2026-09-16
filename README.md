@@ -2,7 +2,7 @@
 
 当你给 ZCode 派了一个活然后去干别的，它干完会主动到 QQ 上喊你回来。
 
-一个 [ZCode](https://z.ai) 插件：当一轮对话的耗时达到阈值（默认 3 分钟，可调）时，通过 [Qmsg 酱](https://qmsg.zendee.cn)给你的 QQ 发送私聊通知。纯 hook 实现，AI 无需配合，不干扰正常对话。
+一个 [ZCode](https://z.ai) 插件：当一轮对话的耗时达到阈值（默认 1 分钟，可调）时，通过 [Qmsg 酱](https://qmsg.zendee.cn)给你的 QQ 发送私聊通知。纯 hook 实现，AI 无需配合，不干扰正常对话。
 
 > A ZCode plugin that sends a QQ private-message notification (via Qmsg) when a conversation turn takes longer than a configurable threshold.
 
@@ -64,7 +64,7 @@ git clone https://github.com/<你的用户名>/zcode-qq-notify.git
 ```json
 {
   "qmsgKey": "你的 Qmsg API Key",
-  "thresholdSeconds": 180
+  "thresholdSeconds": 60
 }
 ```
 

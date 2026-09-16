@@ -1,4 +1,4 @@
 {
   "qmsgKey": "",
-  "thresholdSeconds": 180
+  "thresholdSeconds": 60
 }
