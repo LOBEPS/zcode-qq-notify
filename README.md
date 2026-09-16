@@ -2,9 +2,9 @@
 
 当你给 ZCode 派了一个活然后去干别的，它干完会主动到 QQ 上喊你回来。
 
-一个 [ZCode](https://z.ai) 插件：当一轮对话的耗时达到阈值（默认 1 分钟，可调）时，通过 [Qmsg 酱](https://qmsg.zendee.cn)给你的 QQ 发送私聊通知。纯 hook 实现，AI 无需配合，不干扰正常对话。
+一个 [ZCode](https://z.ai) 插件：回合耗时达到阈值（默认 1 分钟，可调）正常完成时发送"✅ 任务完成"；回合半路死掉（模型流断开等）时发送"⚠️ 任务中断"。纯 hook + 后台看门狗实现，AI 无需配合，不干扰正常对话。
 
-> A ZCode plugin that sends a QQ private-message notification (via Qmsg) when a conversation turn takes longer than a configurable threshold.
+> A ZCode plugin that notifies QQ (via Qmsg) when a conversation turn finishes normally — or dies halfway.
 
 ## 通知长这样
 
@@ -15,6 +15,15 @@
 耗时：5分20秒
 工具调用：14次
 📝 登录模块重构完成：抽出了 AuthService，补了 12 个单测…
+```
+
+回合半路死掉（如模型流断开）时，收到的是中断通知：
+
+```
+⚠️ 任务中断
+任务：重构登录模块并补齐测试
+已运行：12分40秒后失联
+（回合未正常结束，请回 ZCode 查看）
 ```
 
 ## 特性
@@ -64,7 +73,8 @@ git clone https://github.com/<你的用户名>/zcode-qq-notify.git
 ```json
 {
   "qmsgKey": "你的 Qmsg API Key",
-  "thresholdSeconds": 60
+  "thresholdSeconds": 60,
+  "stallMinutes": 5
 }
 ```
 
@@ -73,6 +83,7 @@ git clone https://github.com/<你的用户名>/zcode-qq-notify.git
 | 变量 | 作用 |
 |---|---|
 | `QQ_NOTIFY_THRESHOLD_SECONDS` | 通知阈值（秒），覆盖 `thresholdSeconds` |
+| `QQ_NOTIFY_STALL_MINUTES` | 失联阈值（分钟），覆盖 `stallMinutes` |
 | `QMSG_KEY` | Qmsg API Key，覆盖 `qmsgKey` |
 | `QQ_NOTIFY_DRY_RUN=1` | 只打印不发送，测试用 |
 
@@ -80,10 +91,11 @@ git clone https://github.com/<你的用户名>/zcode-qq-notify.git
 
 ## 工作原理
 
-两个 hook，纯脚本实现：
+两个 hook + 一个后台看门狗，纯脚本实现：
 
-1. **UserPromptSubmit** — 记录回合开始时间、turnId、任务标签（prompt 摘录），状态按会话 ID 隔离存放在系统临时目录
-2. **Stop** — 回合结束时核对 turnId（防止被中断/重发的旧回合误报），时长达到阈值则调用 Qmsg API 发送通知
+1. **UserPromptSubmit** — 记录回合开始时间、turnId、任务标签（prompt 摘录）、会话记录路径，状态按会话 ID 隔离存放在系统临时目录；顺带拉起看门狗（幂等，后台运行，不阻塞会话）
+2. **Stop** — 回合正常结束时核对 turnId（防止被中断/重发的旧回合误报），时长达到阈值则调用 Qmsg API 发送"✅ 任务完成"
+3. **看门狗（watchdog.mjs）** — 单例后台进程，每 30 秒检查各回合的会话记录是否停止更新：状态残留且停更超过失联阈值（默认 5 分钟）→ 发送"⚠️ 任务中断"（每回合最多一次）。ZCode 已关闭时不报警；15 分钟无未决回合自动退出，下次回合开始时自动拉起
 
 依赖：ZCode（支持 hooks 的版本）、Node.js ≥ 18、能访问 `qmsg.zendee.cn`。
 
@@ -91,9 +103,9 @@ git clone https://github.com/<你的用户名>/zcode-qq-notify.git
 
 - **hook 在会话创建时绑定**：安装插件后，**新对话**立即生效；**安装前就已打开的旧对话**需要重启 ZCode（保持这些对话处于打开状态，重启后会被恢复并重新加载 hooks）。之后新建的对话无需任何操作
 - hook 注册在会话启动时快照：安装/卸载/更新插件后需要新会话（或重启 ZCode）才生效；但 `config.json` 的 key/阈值是每次触发时读取的，改完即生效
+- **中断通知有约 5 分钟的天然延迟**（要等失联判定成立）；个别会话拿不到会话记录路径时不报警（宁缺勿滥）；ZCode 关闭期间不报警，重新打开后补报
 - ZCode 桌面版默认工作区拿不到真实项目名，通知中以「任务：prompt 摘录」标识来源
-- Qmsg 酱限流：同一 key 每 5 秒 1 条、每日 500 条
-- **只通知成功完成的回合**：回合因错误中断（如模型流断开、网络抖动）时 ZCode 不触发 Stop 事件，不会有通知——这是设计使然，"失败了"和"完成了"应当区分
+- Qmsg 酱限流：同一 key 每 5 秒 1 条、每日 500 条（看门狗内置 6 秒重试，撞限流可自愈）
 - ⚠️ 不要把真实 API Key 提交到任何公开仓库；建议用 `QMSG_KEY` 环境变量
 
 ## License

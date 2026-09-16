@@ -4,15 +4,18 @@
 //   QQ_NOTIFY_THRESHOLD_SECONDS  通知阈值（秒），优先级最高
 //   QMSG_KEY                     Qmsg API key，优先级高于 config.json
 //   QQ_NOTIFY_DRY_RUN=1          只打印不发送（测试用）
+//   QQ_NOTIFY_STATE_DIR          状态目录覆盖（测试用）
+// 回合开始时会顺带拉起看门狗（watchdog.mjs，幂等）以检测中断回合。
 // 任何失败都静默退出 0，绝不阻塞会话。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const MODE = process.argv[2] || '';
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const STATE_DIR = path.join(os.tmpdir(), 'qq-notify-state');
+const STATE_DIR = process.env.QQ_NOTIFY_STATE_DIR || path.join(os.tmpdir(), 'qq-notify-state');
 const SESSION = (process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || 'unknown')
   .replace(/[^a-zA-Z0-9._-]/g, '_');
 const STATE_FILE = path.join(STATE_DIR, `session-${SESSION}.json`);
@@ -149,6 +152,27 @@ async function onStop(stdin) {
   await send(lines.join('\n'));
 }
 
+// 看门狗已运行则跳过；否则以 detached 方式拉起（不阻塞本 hook）
+function isAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+function ensureWatchdog() {
+  try {
+    const root = path.join(os.tmpdir(), 'qq-notify-watchdog');
+    fs.mkdirSync(root, { recursive: true });
+    const lock = path.join(root, 'daemon.lock');
+    try {
+      const pid = Number(fs.readFileSync(lock, 'utf8'));
+      if (pid && isAlive(pid)) return; // 已在运行
+    } catch { /* 无锁文件 */ }
+    spawn(process.execPath, [path.join(SCRIPT_DIR, 'watchdog.mjs')], {
+      detached: true, stdio: 'ignore', windowsHide: true,
+    }).unref();
+    console.error('qq-notify: 看门狗已拉起');
+  } catch { /* 静默，不影响会话 */ }
+}
+
 async function main() {
   const stdin = await readStdin();
   if (MODE === 'user-prompt-submit') {
@@ -156,7 +180,9 @@ async function main() {
       start: Date.now(),
       turnId: stdin.turnId || stdin.turn_id || '',
       prompt: sanitize(stdin.prompt || '').slice(0, 40),
+      transcriptPath: stdin.transcript_path || stdin.transcriptPath || '',
     });
+    ensureWatchdog();
     sweepOldStates();
   } else if (MODE === 'stop') {
     await onStop(stdin);
