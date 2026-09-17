@@ -1,12 +1,13 @@
-// qq-notify 看门狗 — 检测中断回合并发送"⚠️ 任务中断"通知
-// 由 UserPromptSubmit hook 以 detached 方式拉起（幂等，已在运行则直接退出）：
-//   - 每 30 秒扫描回合状态，跟踪各会话记录文件的更新时间
-//   - 状态残留且会话记录停更达到失联阈值 → 报警（每个回合最多一次）
-//   - ZCode 已关闭时不报警（回头补报）；15 分钟无未决回合自动退出
+// qq-notify 看门狗 — 单次巡检：检测中断回合并发送"⚠️ 任务中断"通知
+// 由 Windows 计划任务每分钟调起（--once，跑完即退）——计划任务进程在 ZCode 的
+// 作业对象之外，不会被会话结束殃及。状态记录在 memory.json，跨巡检累计。
+// 判定：回合状态残留（走了 UserPromptSubmit 却始终没等到 Stop）+ 该会话在
+// ZCode 运行日志中停止追加达到失联阈值 → 报警（每个回合最多一次）。
+// ZCode 已关闭时不报警（回头补报）。
 // 环境变量:
 //   QQ_NOTIFY_STALL_MINUTES      失联阈值（分钟），优先级最高，默认取 config.stallMinutes 或 5
-//   QQ_NOTIFY_WATCHDOG_POLL_MS   轮询间隔（测试用）
 //   QQ_NOTIFY_STATE_DIR          状态目录覆盖（测试用）
+//   QQ_NOTIFY_LOG_DIR            ZCode 日志目录覆盖（测试用）
 //   QMSG_KEY / QQ_NOTIFY_DRY_RUN 同 notify.mjs
 import fs from 'node:fs';
 import os from 'node:os';
@@ -16,11 +17,10 @@ import { fileURLToPath } from 'node:url';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const STATE_DIR = process.env.QQ_NOTIFY_STATE_DIR || path.join(os.tmpdir(), 'qq-notify-state');
+const LOG_DIR = process.env.QQ_NOTIFY_LOG_DIR || path.join(os.homedir(), '.zcode', 'cli', 'log');
 const ROOT = path.join(os.tmpdir(), 'qq-notify-watchdog');
-const LOCK = path.join(ROOT, 'daemon.lock');
 const MEM_FILE = path.join(ROOT, 'memory.json');
-const POLL_MS = Math.max(2000, Number(process.env.QQ_NOTIFY_WATCHDOG_POLL_MS) || 30000);
-const IDLE_EXIT_MS = 15 * 60 * 1000;
+const TAIL_BYTES = 262144; // 日志尾部扫描范围
 
 function loadConfig() {
   const root = process.env.ZCODE_PLUGIN_ROOT || process.env.CLAUDE_PLUGIN_ROOT;
@@ -109,42 +109,73 @@ function saveMem() {
   try { fs.writeFileSync(MEM_FILE, JSON.stringify(mem)); } catch { /* 忽略 */ }
 }
 
+function dayLogFiles() {
+  // 今天 + 昨天：回合跨午夜时最后的活动可能记在昨天的日志里
+  const files = [];
+  for (const off of [0, 86400000]) {
+    const dt = new Date(Date.now() - off);
+    const name = `zcode-${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}.jsonl`;
+    const p = path.join(LOG_DIR, name);
+    try {
+      if (fs.statSync(p).isFile()) files.push(p);
+    } catch { /* 该日无日志 */ }
+  }
+  return files;
+}
+
+// 在日志尾部找该会话最后一条记录：返回 { last: UTC毫秒 }
+function lastActivityFor(sid, files) {
+  let last = 0;
+  for (const p of files) {
+    let st;
+    try { st = fs.statSync(p); } catch { continue; }
+    const size = Math.min(st.size, TAIL_BYTES);
+    const buf = Buffer.alloc(size);
+    const fd = fs.openSync(p, 'r');
+    fs.readSync(fd, buf, 0, size, st.size - size);
+    fs.closeSync(fd);
+    const lines = buf.toString('utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line.includes(`"${sid}"`)) continue;
+      const m = line.match(/"timestamp":"([^"]+)"/);
+      const t = m ? Date.parse(m[1]) : NaN;
+      if (Number.isFinite(t) && t > last) last = t;
+      break; // 该文件里最后一条即停（日志按时间追加）
+    }
+  }
+  return last;
+}
+
 async function poll() {
   let files = [];
   try {
     files = fs.readdirSync(STATE_DIR).filter(f => f.startsWith('session-'));
   } catch { return; }
+  if (files.length === 0) return;
 
-  if (files.length === 0) {
-    if (Date.now() - lastActivity > IDLE_EXIT_MS) {
-      console.error('qq-notify-watchdog: 无未决回合，退出');
-      process.exit(0);
-    }
-    return;
-  }
-
+  const dayFiles = dayLogFiles();
+  if (dayFiles.length === 0) return; // 没有日志可判定
   const currentKeys = new Set();
-  let anyPending = false;
   const stall = stallMs();
 
   for (const f of files) {
     let st;
     try { st = JSON.parse(fs.readFileSync(path.join(STATE_DIR, f), 'utf8')); } catch { continue; }
-    const tp = st.transcriptPath || st.transcript_path;
-    if (!tp) continue; // 拿不到会话记录路径就无法判定，宁缺勿滥
+    const sid = f.replace(/^session-/, '').replace(/\.json$/, '');
+    if (!sid || sid === 'unknown') continue;
     const alertKey = `${f}:${st.turnId || ''}`;
     currentKeys.add(alertKey);
     if (mem.alerted[alertKey]) continue; // 该回合已报警
 
-    let mtime = 0;
-    try { mtime = fs.statSync(tp).mtimeMs; } catch { mtime = 0; } // 文件可能已被清理，沿用最后记录
-    if (mtime > (mem.lastSeen[alertKey] || 0)) {
-      mem.lastSeen[alertKey] = mtime;
+    const last = lastActivityFor(sid, dayFiles);
+    if (!last) continue; // 日志里查无此会话（如看门狗中途加入），宁缺勿滥
+    if (last > (mem.lastSeen[alertKey] || 0)) {
+      mem.lastSeen[alertKey] = last;
       saveMem();
     }
     const seen = mem.lastSeen[alertKey] || 0;
-    if (!seen) continue; // 从未观察到会话记录，无法判定
-    anyPending = true;
+    if (!seen) continue;
     if (Date.now() - seen < stall) continue; // 尚未失联
     if (!zcodeRunning()) continue; // 应用已关闭：不标记不报警，应用恢复后补报
 
@@ -158,33 +189,14 @@ async function poll() {
   for (const k of Object.keys(mem.lastSeen)) {
     if (!currentKeys.has(k)) { delete mem.lastSeen[k]; delete mem.alerted[k]; }
   }
-  if (anyPending) lastActivity = Date.now();
+  saveMem();
 }
-
-function isAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
-}
-
-let lastActivity = Date.now();
 
 async function main() {
   fs.mkdirSync(ROOT, { recursive: true });
-  try {
-    fs.writeFileSync(LOCK, String(process.pid), { flag: 'wx' });
-  } catch {
-    let pid = 0;
-    try { pid = Number(fs.readFileSync(LOCK, 'utf8')); } catch { /* 当作陈旧锁 */ }
-    if (pid && isAlive(pid)) process.exit(0); // 已有实例在运行
-    fs.writeFileSync(LOCK, String(process.pid)); // 接管陈旧锁
-  }
   try { mem = JSON.parse(fs.readFileSync(MEM_FILE, 'utf8')); } catch { /* 首次运行 */ }
-  if (process.argv.includes('--once')) {
-    await poll();
-    saveMem();
-    process.exit(0);
-  }
-  console.error(`qq-notify-watchdog: 运行中 (pid ${process.pid}, 轮询 ${POLL_MS}ms)`);
-  setInterval(() => { poll().catch(e => console.error(`qq-notify-watchdog: ${e?.message || e}`)); }, POLL_MS);
+  await poll();
+  saveMem();
 }
 
 main().catch(e => { console.error(`qq-notify-watchdog: ${e?.message || e}`); process.exit(0); });

@@ -1,7 +1,7 @@
 {
   "name": "qq-notify",
   "hooks": "hooks",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Notify QQ via Qmsg when a ZCode turn completes (>= threshold seconds). 任务完成 QQ 通知。",
   "author": {
     "name": "LOBEPS"

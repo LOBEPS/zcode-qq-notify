@@ -5,12 +5,12 @@
 //   QMSG_KEY                     Qmsg API key，优先级高于 config.json
 //   QQ_NOTIFY_DRY_RUN=1          只打印不发送（测试用）
 //   QQ_NOTIFY_STATE_DIR          状态目录覆盖（测试用）
-// 回合开始时会顺带拉起看门狗（watchdog.mjs，幂等）以检测中断回合。
+// 回合开始时会确保看门狗计划任务已注册（watchdog.mjs 每分钟单次巡检）以检测中断回合。
 // 任何失败都静默退出 0，绝不阻塞会话。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const MODE = process.argv[2] || '';
@@ -152,25 +152,34 @@ async function onStop(stdin) {
   await send(lines.join('\n'));
 }
 
-// 看门狗已运行则跳过；否则以 detached 方式拉起（不阻塞本 hook）
-function isAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
-}
-
-function ensureWatchdog() {
+// 看门狗由 Windows 计划任务驱动（每分钟单次巡检，其进程在 ZCode 的作业对象之外，
+// 不会被会话结束殃及）。这里只负责注册/自愈：路径变化或每日首次触发时校验重建。
+function ensureTask() {
   try {
     const root = path.join(os.tmpdir(), 'qq-notify-watchdog');
     fs.mkdirSync(root, { recursive: true });
-    const lock = path.join(root, 'daemon.lock');
+    const marker = path.join(root, 'task-marker.json');
+    const want = JSON.stringify({ dir: SCRIPT_DIR, day: new Date().toISOString().slice(0, 10) });
+    let cur = '';
+    try { cur = fs.readFileSync(marker, 'utf8'); } catch { /* 首次 */ }
+    if (cur === want) return; // 今天已校验过
+    const tn = 'qq-notify-watchdog';
+    let exists = true;
     try {
-      const pid = Number(fs.readFileSync(lock, 'utf8'));
-      if (pid && isAlive(pid)) return; // 已在运行
-    } catch { /* 无锁文件 */ }
-    spawn(process.execPath, [path.join(SCRIPT_DIR, 'watchdog.mjs')], {
-      detached: true, stdio: 'ignore', windowsHide: true,
-    }).unref();
-    console.error('qq-notify: 看门狗已拉起');
-  } catch { /* 静默，不影响会话 */ }
+      execSync(`schtasks /Query /TN "${tn}"`, { timeout: 10000, windowsHide: true, stdio: 'ignore' });
+    } catch { exists = false; }
+    if (!exists) {
+      const vbs = path.join(SCRIPT_DIR, 'run-hidden.vbs');
+      const wd = path.join(SCRIPT_DIR, 'watchdog.mjs');
+      execSync(`schtasks /Create /F /SC MINUTE /MO 1 /TN "${tn}" /TR "wscript.exe ${vbs} ${wd}"`, {
+        timeout: 15000, windowsHide: true, stdio: 'ignore',
+      });
+      console.error('qq-notify: 看门狗计划任务已注册');
+    }
+    fs.writeFileSync(marker, want);
+  } catch (e) {
+    console.error(`qq-notify: 看门狗计划任务注册失败 ${e?.message || e}`);
+  }
 }
 
 async function main() {
@@ -182,7 +191,7 @@ async function main() {
       prompt: sanitize(stdin.prompt || '').slice(0, 40),
       transcriptPath: stdin.transcript_path || stdin.transcriptPath || '',
     });
-    ensureWatchdog();
+    ensureTask();
     sweepOldStates();
   } else if (MODE === 'stop') {
     await onStop(stdin);

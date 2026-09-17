@@ -9,7 +9,7 @@
       "name": "qq-notify",
       "source": "./qq-notify",
       "description": "Notify QQ via Qmsg when a ZCode turn completes (>= threshold seconds). 任务完成时通过 Qmsg 酱给你的 QQ 发私聊通知。",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "author": {
         "name": "lenovo"
       },
