@@ -96,7 +96,7 @@ async function send(text) {
 
 function buildMessage(st, ranSec) {
   const lines = ['⚠️ 任务中断'];
-  const proj = projectName();
+  const proj = st.project || projectName(); // 计划任务环境无项目目录变量，用状态里固化的
   if (proj && proj !== 'default') lines.push(`项目：${proj}`);
   if (st.prompt) lines.push(`任务：${st.prompt}`);
   lines.push(`已运行：${formatDuration(ranSec)}后失联`);

@@ -190,6 +190,7 @@ async function main() {
       turnId: stdin.turnId || stdin.turn_id || '',
       prompt: sanitize(stdin.prompt || '').slice(0, 40),
       transcriptPath: stdin.transcript_path || stdin.transcriptPath || '',
+      project: projectName(), // 计划任务环境没有项目目录环境变量，须在此固化
     });
     ensureTask();
     sweepOldStates();
