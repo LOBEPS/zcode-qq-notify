@@ -1,26 +1,26 @@
-// qq-notify 看门狗 — 单次巡检：检测中断回合并发送"⚠️ 任务中断"通知
-// 由 Windows 计划任务每分钟调起（--once，跑完即退）——计划任务进程在 ZCode 的
-// 作业对象之外，不会被会话结束殃及。状态记录在 memory.json，跨巡检累计。
-// 判定：回合状态残留（走了 UserPromptSubmit 却始终没等到 Stop）+ 该会话在
-// ZCode 运行日志中停止追加达到失联阈值 → 报警（每个回合最多一次）。
-// ZCode 已关闭时不报警（回头补报）。
+// qq-notify 看门狗 — 单次巡检（由 Windows 计划任务每分钟调起，跑完即退）
+// 通知源 = ZCode 运行日志 + 会话数据库，不依赖 hook —— 老对话、SSH 对话、
+// 后台任务子会话一律覆盖（hook 只负责确保本计划任务注册，见 notify.mjs）。
+//   turn.completed 且时长 ≥ 通知阈值 → "✅ 任务完成"
+//   turn.started 后该会话日志沉默超过失联阈值 → "⚠️ 任务中断"（每回合最多一次）
 // 环境变量:
-//   QQ_NOTIFY_STALL_MINUTES      失联阈值（分钟），优先级最高，默认取 config.stallMinutes 或 5
-//   QQ_NOTIFY_STATE_DIR          状态目录覆盖（测试用）
-//   QQ_NOTIFY_LOG_DIR            ZCode 日志目录覆盖（测试用）
+//   QQ_NOTIFY_THRESHOLD_SECONDS  通知阈值（秒），优先级最高
+//   QQ_NOTIFY_STALL_MINUTES      失联阈值（分钟），优先级最高
+//   QQ_NOTIFY_LOG_DIR / QQ_NOTIFY_DB_PATH / QQ_NOTIFY_STATE_DIR  路径覆盖（测试用）
 //   QMSG_KEY / QQ_NOTIFY_DRY_RUN 同 notify.mjs
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const STATE_DIR = process.env.QQ_NOTIFY_STATE_DIR || path.join(os.tmpdir(), 'qq-notify-state');
 const LOG_DIR = process.env.QQ_NOTIFY_LOG_DIR || path.join(os.homedir(), '.zcode', 'cli', 'log');
+const DB_PATH = process.env.QQ_NOTIFY_DB_PATH || path.join(os.homedir(), '.zcode', 'cli', 'db', 'db.sqlite');
 const ROOT = path.join(os.tmpdir(), 'qq-notify-watchdog');
 const MEM_FILE = path.join(ROOT, 'memory.json');
-const TAIL_BYTES = 262144; // 日志尾部扫描范围
+const TAIL_BYTES = 8 * 1024 * 1024; // 当日日志最大读取范围
 
 function loadConfig() {
   const root = process.env.ZCODE_PLUGIN_ROOT || process.env.CLAUDE_PLUGIN_ROOT;
@@ -34,6 +34,14 @@ function loadConfig() {
   return {};
 }
 
+function thresholdSec() {
+  const envV = Number(process.env.QQ_NOTIFY_THRESHOLD_SECONDS);
+  if (Number.isFinite(envV) && envV > 0) return envV;
+  const cfgV = Number(loadConfig().thresholdSeconds);
+  if (Number.isFinite(cfgV) && cfgV > 0) return cfgV;
+  return 600;
+}
+
 function stallMs() {
   const envV = Number(process.env.QQ_NOTIFY_STALL_MINUTES);
   if (Number.isFinite(envV) && envV > 0) return envV * 60000;
@@ -42,9 +50,14 @@ function stallMs() {
   return 5 * 60000;
 }
 
-function projectName() {
-  const dir = process.env.ZCODE_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  return path.basename(dir) || '未知项目';
+function sanitize(text) {
+  return String(text || '')
+    .replace(/https?:\/\/\S+/g, '链接')
+    .replace(/\d{7,}/g, '…')
+    .replace(/[#*`>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 100);
 }
 
 function formatDuration(sec) {
@@ -66,6 +79,69 @@ function zcodeRunning() {
   } catch {
     return true; // 查询失败按运行中处理，宁可误报不可漏报
   }
+}
+
+// —— 会话数据库（只读，失败返回 null，通知仍可发送只是缺素材）——
+function withDb(fn) {
+  let dbh = null;
+  try {
+    dbh = new DatabaseSync(DB_PATH, { readOnly: true });
+    return fn(dbh);
+  } catch { return null; }
+  finally { try { dbh?.close(); } catch { /* 忽略 */ } }
+}
+
+function sessionTitle(dbh, sid) {
+  if (!dbh) return '';
+  try {
+    const r = dbh.prepare('SELECT title FROM session WHERE id = ?').get(sid);
+    return String(r?.title || '');
+  } catch { return ''; }
+}
+
+function lastPromptBefore(dbh, sid, ts) {
+  if (!dbh) return '';
+  try {
+    const r = dbh.prepare(
+      'SELECT text FROM input_history WHERE session_id = ? AND time_created <= ? ORDER BY time_created DESC LIMIT 1',
+    ).get(sid, ts);
+    return String(r?.text || '');
+  } catch { return ''; }
+}
+
+// 从 message.data 提取文本（结构防御式解析）
+function messageText(data) {
+  try {
+    const d = typeof data === 'string' ? JSON.parse(data) : data;
+    if (typeof d?.text === 'string' && d.text.trim()) return d.text;
+    if (Array.isArray(d?.parts)) {
+      const t = d.parts.filter(p => p?.type === 'text' || typeof p?.text === 'string')
+        .map(p => p?.text || '').join(' ');
+      if (t.trim()) return t;
+    }
+    if (typeof d?.content === 'string' && d.content.trim()) return d.content;
+  } catch { /* 忽略 */ }
+  return '';
+}
+
+function lastAssistantTextBefore(dbh, sid, ts) {
+  if (!dbh) return '';
+  try {
+    const rows = dbh.prepare(
+      'SELECT data FROM message WHERE session_id = ? ORDER BY sequence DESC LIMIT 8',
+    ).all(sid);
+    for (const r of rows) {
+      try {
+        const d = JSON.parse(r.data);
+        const created = d?.time?.completed || d?.time?.created || 0;
+        if (d?.role !== 'assistant') continue;
+        if (created && created > ts) continue; // 只取回合结束前产生的消息
+        const text = messageText(d);
+        if (text.trim()) return text;
+      } catch { continue; }
+    }
+  } catch { /* 忽略 */ }
+  return '';
 }
 
 async function send(text) {
@@ -94,100 +170,121 @@ async function send(text) {
   }
 }
 
-function buildMessage(st, ranSec) {
-  const lines = ['⚠️ 任务中断'];
-  const proj = st.project || projectName(); // 计划任务环境无项目目录变量，用状态里固化的
-  if (proj && proj !== 'default') lines.push(`项目：${proj}`);
-  if (st.prompt) lines.push(`任务：${st.prompt}`);
-  lines.push(`已运行：${formatDuration(ranSec)}后失联`);
-  lines.push('（回合未正常结束，请回 ZCode 查看）');
-  return lines.join('\n');
-}
-
-let mem = { lastSeen: {}, alerted: {} };
+let mem = { notified: {}, lastSeen: {} };
 function saveMem() {
   try { fs.writeFileSync(MEM_FILE, JSON.stringify(mem)); } catch { /* 忽略 */ }
 }
 
-function dayLogFiles() {
-  // 今天 + 昨天：回合跨午夜时最后的活动可能记在昨天的日志里
-  const files = [];
-  for (const off of [0, 86400000]) {
-    const dt = new Date(Date.now() - off);
-    const name = `zcode-${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}.jsonl`;
-    const p = path.join(LOG_DIR, name);
-    try {
-      if (fs.statSync(p).isFile()) files.push(p);
-    } catch { /* 该日无日志 */ }
-  }
-  return files;
-}
-
-// 在日志尾部找该会话最后一条记录：返回 { last: UTC毫秒 }
-function lastActivityFor(sid, files) {
-  let last = 0;
-  for (const p of files) {
-    let st;
-    try { st = fs.statSync(p); } catch { continue; }
+// 解析当日日志，聚合回合生命周期与本会话最后活动时间
+function scanLog() {
+  const dt = new Date();
+  const name = `zcode-${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}.jsonl`;
+  const p = path.join(LOG_DIR, name);
+  let raw = '';
+  try {
+    const st = fs.statSync(p);
     const size = Math.min(st.size, TAIL_BYTES);
     const buf = Buffer.alloc(size);
     const fd = fs.openSync(p, 'r');
     fs.readSync(fd, buf, 0, size, st.size - size);
     fs.closeSync(fd);
-    const lines = buf.toString('utf8').split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i];
-      if (!line.includes(`"${sid}"`)) continue;
-      const m = line.match(/"timestamp":"([^"]+)"/);
-      const t = m ? Date.parse(m[1]) : NaN;
-      if (Number.isFinite(t) && t > last) last = t;
-      break; // 该文件里最后一条即停（日志按时间追加）
+    raw = buf.toString('utf8');
+  } catch { return { turns: {}, sessionLast: {} }; }
+
+  const turns = {};   // turnId → { sess, started, completed, tools }
+  const sessionLast = {}; // sid → 最后一条日志的 UTC 毫秒
+  for (const line of raw.split('\n')) {
+    if (!line.startsWith('{')) continue;
+    let j;
+    try { j = JSON.parse(line); } catch { continue; }
+    const sid = j.sessionId || '';
+    const ts = Date.parse(j.timestamp || '');
+    if (sid && Number.isFinite(ts)) {
+      if (!sessionLast[sid] || ts > sessionLast[sid]) sessionLast[sid] = ts;
+    }
+    if (j.event !== 'turn.started' && j.event !== 'turn.completed') continue;
+    const tid = j.turnId || '';
+    if (!tid) continue;
+    turns[tid] = turns[tid] || { sess: sid, started: 0, completed: 0, tools: 0 };
+    if (j.event === 'turn.started') {
+      turns[tid].sess = sid;
+      turns[tid].started = Date.parse(j.timestamp);
+    } else {
+      turns[tid].completed = Date.parse(j.timestamp);
+      turns[tid].tools = j.context?.toolCallCount ?? 0;
     }
   }
-  return last;
+  return { turns, sessionLast };
 }
 
 async function poll() {
-  let files = [];
-  try {
-    files = fs.readdirSync(STATE_DIR).filter(f => f.startsWith('session-'));
-  } catch { return; }
-  if (files.length === 0) return;
-
-  const dayFiles = dayLogFiles();
-  if (dayFiles.length === 0) return; // 没有日志可判定
-  const currentKeys = new Set();
+  const { turns, sessionLast } = scanLog();
   const stall = stallMs();
+  const th = thresholdSec();
+  const seenKeys = new Set();
 
-  for (const f of files) {
-    let st;
-    try { st = JSON.parse(fs.readFileSync(path.join(STATE_DIR, f), 'utf8')); } catch { continue; }
-    const sid = f.replace(/^session-/, '').replace(/\.json$/, '');
-    if (!sid || sid === 'unknown') continue;
-    const alertKey = `${f}:${st.turnId || ''}`;
-    currentKeys.add(alertKey);
-    if (mem.alerted[alertKey]) continue; // 该回合已报警
+  for (const [tid, t] of Object.entries(turns)) {
+    if (!t.sess) continue;
+    const key = `${tid}:${t.sess.slice(5, 13)}`;
+    seenKeys.add(key);
 
-    const last = lastActivityFor(sid, dayFiles);
-    if (!last) continue; // 日志里查无此会话（如看门狗中途加入），宁缺勿滥
-    if (last > (mem.lastSeen[alertKey] || 0)) {
-      mem.lastSeen[alertKey] = last;
+    if (t.completed) {
+      // —— 正常完成 → 达标则 ✅ ——
+      if (mem.notified[key]) continue;
+      mem.notified[key] = 'skip'; // 先占位，防止巡检并发重复
       saveMem();
+      if (!t.started) continue; // 起点（昨日）不在当日日志，时长不可知
+      const durSec = (t.completed - t.started) / 1000;
+      if (durSec < th) continue; // 未达阈值
+      const info = withDb(db => ({
+        title: sessionTitle(db, t.sess),
+        label: lastPromptBefore(db, t.sess, t.completed),
+        summary: lastAssistantTextBefore(db, t.sess, t.completed),
+      })) || {};
+      const lines = ['✅ 任务完成'];
+      if (info.title) lines.push(`对话：${sanitize(info.title).slice(0, 40)}`);
+      if (info.label) lines.push(`任务：${sanitize(info.label).slice(0, 40)}`);
+      lines.push(`耗时：${formatDuration(durSec)}`);
+      lines.push(`工具调用：${t.tools}次`);
+      const summary = sanitize(info.summary);
+      if (summary) lines.push(`📝 ${summary}`);
+      await send(lines.join('\n'));
+      mem.notified[key] = 'done';
+      saveMem();
+    } else {
+      // —— 已开始未完成 → 会话日志沉默达到失联阈值则 ⚠️ ——
+      if (mem.notified[key]) continue;
+      const last = sessionLast[t.sess] || 0;
+      if (last > (mem.lastSeen[key] || 0)) {
+        mem.lastSeen[key] = last;
+        saveMem();
+      }
+      const seen = mem.lastSeen[key] || 0;
+      if (!seen) continue; // 会话在日志中查无活动，宁缺勿滥
+      if (Date.now() - seen < stall) continue; // 还活着
+      if (!zcodeRunning()) continue; // 应用已关闭：不标记不报警，恢复后补报
+      mem.notified[key] = 'aborted';
+      saveMem();
+      const info = withDb(db => ({
+        title: sessionTitle(db, t.sess),
+        label: lastPromptBefore(db, t.sess, Date.now()),
+      })) || {};
+      const lines = ['⚠️ 任务中断'];
+      if (info.title) lines.push(`对话：${sanitize(info.title).slice(0, 40)}`);
+      if (info.label) lines.push(`任务：${sanitize(info.label).slice(0, 40)}`);
+      lines.push(`已运行：${formatDuration((Date.now() - t.started) / 1000)}后失联`);
+      lines.push('（回合未正常结束，请回 ZCode 查看）');
+      await send(lines.join('\n'));
     }
-    const seen = mem.lastSeen[alertKey] || 0;
-    if (!seen) continue;
-    if (Date.now() - seen < stall) continue; // 尚未失联
-    if (!zcodeRunning()) continue; // 应用已关闭：不标记不报警，应用恢复后补报
-
-    mem.alerted[alertKey] = true;
-    saveMem();
-    const ranSec = st.start ? (Date.now() - st.start) / 1000 : 0;
-    await send(buildMessage(st, ranSec));
   }
 
-  // 清理已消失回合的记忆
-  for (const k of Object.keys(mem.lastSeen)) {
-    if (!currentKeys.has(k)) { delete mem.lastSeen[k]; delete mem.alerted[k]; }
+  // 记忆清理：当日日志中已不见的回合（且非今日新增）逐出，防止无限增长
+  for (const key of Object.keys(mem.notified)) {
+    const tid = key.slice(0, key.lastIndexOf(':'));
+    if (!turns[tid]) delete mem.notified[key];
+  }
+  for (const key of Object.keys(mem.lastSeen)) {
+    if (!turns[key.slice(0, key.lastIndexOf(':'))]) delete mem.lastSeen[key];
   }
   saveMem();
 }
@@ -195,6 +292,8 @@ async function poll() {
 async function main() {
   fs.mkdirSync(ROOT, { recursive: true });
   try { mem = JSON.parse(fs.readFileSync(MEM_FILE, 'utf8')); } catch { /* 首次运行 */ }
+  mem.notified = mem.notified || {};   // 兼容旧版 memory 格式
+  mem.lastSeen = mem.lastSeen || {};
   await poll();
   saveMem();
 }
