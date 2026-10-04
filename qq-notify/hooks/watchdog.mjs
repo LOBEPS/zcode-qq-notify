@@ -191,8 +191,8 @@ function scanLog() {
     raw = buf.toString('utf8');
   } catch { return { turns: {}, sessionLast: {} }; }
 
-  const turns = {};   // turnId → { sess, started, completed, tools }
-  const sessionLast = {}; // sid → 最后一条日志的 UTC 毫秒
+  const turns = {};        // turnId → { sess, started, completed, tools }
+  const sessionLast = {};  // sid → { ts: 最后一条日志的 UTC 毫秒, evt: 事件名 }
   for (const line of raw.split('\n')) {
     if (!line.startsWith('{')) continue;
     let j;
@@ -200,7 +200,9 @@ function scanLog() {
     const sid = j.sessionId || '';
     const ts = Date.parse(j.timestamp || '');
     if (sid && Number.isFinite(ts)) {
-      if (!sessionLast[sid] || ts > sessionLast[sid]) sessionLast[sid] = ts;
+      const cur = sessionLast[sid];
+      // 同毫秒事件按文件顺序后写优先
+      if (!cur || ts >= cur.ts) sessionLast[sid] = { ts, evt: String(j.event || j.message || '') };
     }
     if (j.event !== 'turn.started' && j.event !== 'turn.completed') continue;
     const tid = j.turnId || '';
@@ -254,7 +256,8 @@ async function poll() {
     } else {
       // —— 已开始未完成 → 会话日志沉默达到失联阈值则 ⚠️ ——
       if (mem.notified[key]) continue;
-      const last = sessionLast[t.sess] || 0;
+      const act = sessionLast[t.sess];
+      const last = act ? act.ts : 0;
       if (last > (mem.lastSeen[key] || 0)) {
         mem.lastSeen[key] = last;
         saveMem();
@@ -262,6 +265,8 @@ async function poll() {
       const seen = mem.lastSeen[key] || 0;
       if (!seen) continue; // 会话在日志中查无活动，宁缺勿滥
       if (Date.now() - seen < stall) continue; // 还活着
+      // 最后一条事件是请求/工具"开始"型 = 有东西在途（长工具调用、生成中），不算失联
+      if (act && /^(model\.request|tool\.call)\.started$/.test(act.evt)) continue;
       if (!zcodeRunning()) continue; // 应用已关闭：不标记不报警，恢复后补报
       mem.notified[key] = 'aborted';
       saveMem();
