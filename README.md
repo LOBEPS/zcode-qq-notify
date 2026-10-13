@@ -60,12 +60,23 @@ git clone https://github.com/<你的用户名>/zcode-qq-notify.git
 
 然后 ZCode → 插件市场 →「+ 新建」→ 选择克隆出来的目录。
 
-### 第三步：填入你的 API Key
+### 第三步：填入你的 API Key（推荐用户级文件，更新安全）
 
-二选一：
+**方式一（强烈推荐）：用户级文件 `~/.qq-notify.json`**——插件目录之外的独立文件，插件市场"更新"永远不会碰它：
 
-- **环境变量（推荐）**：设置系统环境变量 `QMSG_KEY` 为你的 key，重启 ZCode 生效
-- **配置文件**：编辑插件安装目录下的 `config.json`，把 `qmsgKey` 换成你的 key
+```json
+{
+  "qmsgKey": "你的 Qmsg API Key"
+}
+```
+
+**方式二**：环境变量 `QMSG_KEY`（重启 ZCode 生效）
+
+**方式三**：插件目录的 `config.json`——⚠️ 注意：插件市场点"更新"会用仓库的空 key 模板覆盖它，不推荐
+
+Key 解析优先级：环境变量 > `~/.qq-notify.json` > 插件 `config.json`。
+
+> 排障提示：如果通知突然消失，查看 `~/.zcode/../AppData/Local/Temp/qq-notify-watchdog/memory.json`——回合被标记为 `nokey` 说明 key 全部失配，`failed` 说明发送重试 3 次仍失败（网络/限流）。
 
 ## 配置
 
