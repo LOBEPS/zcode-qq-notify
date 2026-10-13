@@ -20,7 +20,15 @@ const LOG_DIR = process.env.QQ_NOTIFY_LOG_DIR || path.join(os.homedir(), '.zcode
 const DB_PATH = process.env.QQ_NOTIFY_DB_PATH || path.join(os.homedir(), '.zcode', 'cli', 'db', 'db.sqlite');
 const ROOT = path.join(os.tmpdir(), 'qq-notify-watchdog');
 const MEM_FILE = path.join(ROOT, 'memory.json');
+const RUN_LOCK = path.join(ROOT, 'run.lock');
 const TAIL_BYTES = 8 * 1024 * 1024; // 当日日志最大读取范围
+
+// 巡检互斥锁：单次巡检可能因回执等待耗时 1-2 分钟，防止计划任务重叠导致双发
+function touchRunLock() {
+  try { fs.utimesSync(RUN_LOCK, new Date(), new Date()); } catch {
+    try { fs.writeFileSync(RUN_LOCK, String(process.pid)); } catch { /* 忽略 */ }
+  }
+}
 
 function loadConfig() {
   const root = process.env.ZCODE_PLUGIN_ROOT || process.env.CLAUDE_PLUGIN_ROOT;
@@ -156,7 +164,31 @@ function resolveKey() {
   return loadConfig().qmsgKey || '';
 }
 
-async function send(text) {
+// —— Qmsg 发送（带违规自愈）——
+// Qmsg 的内容过滤是云识别、异步判定：发送接口返回 success:true 也可能事后判违规（状态2）不投递。
+// 因此发送后轮询回执：违规 → 自动降级为通用文案重发，保证通知一定到达。
+async function qmsgSend(key, text) {
+  const res = await fetch(
+    `https://qmsg.zendee.cn/v3/send/${key}?msg=${encodeURIComponent(text)}`,
+    { signal: AbortSignal.timeout(8000) },
+  );
+  const body = await res.json().catch(() => ({}));
+  console.error(`qq-notify-watchdog: Qmsg ${res.status} success=${body.success}`);
+  return { ok: !!body.success, msgId: body.data };
+}
+
+async function qmsgStatus(key, msgId) {
+  try {
+    const res = await fetch(
+      `https://qmsg.zendee.cn/v3/msg/status/${key}?msgId=${msgId}`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    const body = await res.json().catch(() => ({}));
+    return body.data; // 0未回执 1成功 2违规 -1失败
+  } catch { return 0; }
+}
+
+async function send(text, fallbackText) {
   const key = resolveKey();
   if (!key) {
     console.error('qq-notify-watchdog: 未配置 key（QMSG_KEY 环境变量 / ~/.qq-notify.json / config.json 均为空）');
@@ -168,13 +200,29 @@ async function send(text) {
   }
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = await fetch(
-        `https://qmsg.zendee.cn/v3/send/${key}?msg=${encodeURIComponent(text)}`,
-        { signal: AbortSignal.timeout(8000) },
-      );
-      const body = await res.json().catch(() => ({}));
-      console.error(`qq-notify-watchdog: Qmsg ${res.status} success=${body.success}`);
-      if (body.success) return true;
+      const r = await qmsgSend(key, text);
+      if (!r.ok || !r.msgId) throw new Error('发送被拒绝');
+      touchRunLock();
+      let st = 0;
+      for (const wait of [5000, 8000]) { // 等异步回执（QQ 返回 + 违规判定）
+        await new Promise(rs => setTimeout(rs, wait));
+        st = await qmsgStatus(key, r.msgId);
+        if (st !== 0) break;
+      }
+      if (st === 1) return true;
+      if (st === 0) return true; // 已提交，回执未返，按成功处理
+      if (st === 2 && fallbackText) {
+        console.error('qq-notify-watchdog: 内容被判违规，降级为通用文案重发');
+        await new Promise(rs => setTimeout(rs, 6000)); // 限流 1条/5秒
+        const r2 = await qmsgSend(key, fallbackText);
+        if (r2.ok && r2.msgId) {
+          await new Promise(rs => setTimeout(rs, 6000));
+          const st2 = await qmsgStatus(key, r2.msgId);
+          return st2 === 1 || st2 === 0;
+        }
+        return false;
+      }
+      // st === -1 发送失败 → 走重试
     } catch (e) {
       console.error(`qq-notify-watchdog: 发送失败 ${e?.cause?.message || e?.message || e}`);
     }
@@ -264,7 +312,10 @@ async function poll() {
       lines.push(`工具调用：${t.tools}次`);
       const summary = sanitize(info.summary);
       if (summary) lines.push(`📝 ${summary}`);
-      const r = await send(lines.join('\n'));
+      const r = await send(
+        lines.join('\n'),
+        ['✅ 任务完成（通知详情被过滤，请回 ZCode 查看）', `耗时：${formatDuration(durSec)}`, `工具调用：${t.tools}次`].join('\n'),
+      );
       if (r === true) {
         mem.notified[key] = 'done';
         if (mem.sendFail) delete mem.sendFail[key];
@@ -302,7 +353,10 @@ async function poll() {
       if (info.label) lines.push(`任务：${sanitize(info.label).slice(0, 40)}`);
       lines.push(`已运行：${formatDuration((Date.now() - t.started) / 1000)}后失联`);
       lines.push('（回合未正常结束，请回 ZCode 查看）');
-      const r = await send(lines.join('\n'));
+      const r = await send(
+        lines.join('\n'),
+        ['⚠️ 任务中断（详情被过滤，请回 ZCode 查看）', `已运行：${formatDuration((Date.now() - t.started) / 1000)}后失联`].join('\n'),
+      );
       if (r === true) {
         mem.notified[key] = 'aborted';
         if (mem.sendFail) delete mem.sendFail[key];
@@ -332,6 +386,11 @@ async function poll() {
 
 async function main() {
   fs.mkdirSync(ROOT, { recursive: true });
+  try {
+    const st = fs.statSync(RUN_LOCK);
+    if (Date.now() - st.mtimeMs < 180000) process.exit(0); // 上一次巡检仍在进行
+  } catch { /* 无锁，继续 */ }
+  fs.writeFileSync(RUN_LOCK, String(process.pid));
   try { mem = JSON.parse(fs.readFileSync(MEM_FILE, 'utf8')); } catch { /* 首次运行 */ }
   mem.notified = mem.notified || {};   // 兼容旧版 memory 格式
   mem.lastSeen = mem.lastSeen || {};
