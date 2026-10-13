@@ -144,15 +144,27 @@ function lastAssistantTextBefore(dbh, sid, ts) {
   return '';
 }
 
+// Key 解析优先级：环境变量 QMSG_KEY > 用户级 ~/.qq-notify.json（更新安全）> 插件 config.json
+// 用户级文件是重点：插件市场"更新"会用仓库的空 key 模板覆盖插件目录的 config.json，
+// 而 ~/.qq-notify.json 在插件目录之外，永不被动。
+function resolveKey() {
+  if (process.env.QMSG_KEY) return process.env.QMSG_KEY;
+  try {
+    const u = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.qq-notify.json'), 'utf8'));
+    if (u.qmsgKey) return String(u.qmsgKey);
+  } catch { /* 无用户级文件 */ }
+  return loadConfig().qmsgKey || '';
+}
+
 async function send(text) {
-  const key = process.env.QMSG_KEY || loadConfig().qmsgKey;
+  const key = resolveKey();
   if (!key) {
-    console.error('qq-notify-watchdog: 未配置 QMSG_KEY 或 config.json 的 qmsgKey');
-    return;
+    console.error('qq-notify-watchdog: 未配置 key（QMSG_KEY 环境变量 / ~/.qq-notify.json / config.json 均为空）');
+    return 'nokey';
   }
   if (process.env.QQ_NOTIFY_DRY_RUN === '1') {
     console.error(`qq-notify-watchdog: DRY RUN 未发送，消息内容:\n${text}`);
-    return;
+    return true;
   }
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -162,12 +174,13 @@ async function send(text) {
       );
       const body = await res.json().catch(() => ({}));
       console.error(`qq-notify-watchdog: Qmsg ${res.status} success=${body.success}`);
-      if (body.success) return;
+      if (body.success) return true;
     } catch (e) {
       console.error(`qq-notify-watchdog: 发送失败 ${e?.cause?.message || e?.message || e}`);
     }
     if (attempt === 0) await new Promise(r => setTimeout(r, 6000)); // Qmsg 限流 1条/5秒
   }
+  return false;
 }
 
 let mem = { notified: {}, lastSeen: {} };
@@ -232,12 +245,13 @@ async function poll() {
 
     if (t.completed) {
       // —— 正常完成 → 达标则 ✅ ——
-      if (mem.notified[key]) continue;
-      mem.notified[key] = 'skip'; // 先占位，防止巡检并发重复
-      saveMem();
-      if (!t.started) continue; // 起点（昨日）不在当日日志，时长不可知
+      const st0 = mem.notified[key];
+      if (st0 === 'done' || st0 === 'skip' || st0 === 'failed' || st0 === 'nokey') continue;
+      if (!t.started) { mem.notified[key] = 'skip'; saveMem(); continue; } // 起点不在当日日志
       const durSec = (t.completed - t.started) / 1000;
-      if (durSec < th) continue; // 未达阈值
+      if (durSec < th) { mem.notified[key] = 'skip'; saveMem(); continue; } // 未达阈值
+      const fails = mem.sendFail?.[key] || 0;
+      if (fails >= 3) { mem.notified[key] = 'failed'; saveMem(); continue; } // 重试穷尽
       const info = withDb(db => ({
         title: sessionTitle(db, t.sess),
         label: lastPromptBefore(db, t.sess, t.completed),
@@ -250,12 +264,21 @@ async function poll() {
       lines.push(`工具调用：${t.tools}次`);
       const summary = sanitize(info.summary);
       if (summary) lines.push(`📝 ${summary}`);
-      await send(lines.join('\n'));
-      mem.notified[key] = 'done';
+      const r = await send(lines.join('\n'));
+      if (r === true) {
+        mem.notified[key] = 'done';
+        if (mem.sendFail) delete mem.sendFail[key];
+      } else if (r === 'nokey') {
+        mem.notified[key] = 'nokey';
+      } else {
+        mem.sendFail = mem.sendFail || {};
+        mem.sendFail[key] = fails + 1; // 发送失败，下轮巡检重试
+      }
       saveMem();
     } else {
       // —— 已开始未完成 → 会话日志沉默达到失联阈值则 ⚠️ ——
-      if (mem.notified[key]) continue;
+      const st0 = mem.notified[key];
+      if (st0 === 'aborted' || st0 === 'nokey' || st0 === 'failed') continue;
       const act = sessionLast[t.sess];
       const last = act ? act.ts : 0;
       if (last > (mem.lastSeen[key] || 0)) {
@@ -268,8 +291,8 @@ async function poll() {
       // 最后一条事件是请求/工具"开始"型 = 有东西在途（长工具调用、生成中），不算失联
       if (act && /^(model\.request|tool\.call)\.started$/.test(act.evt)) continue;
       if (!zcodeRunning()) continue; // 应用已关闭：不标记不报警，恢复后补报
-      mem.notified[key] = 'aborted';
-      saveMem();
+      const fails = mem.sendFail?.[key] || 0;
+      if (fails >= 3) { mem.notified[key] = 'failed'; saveMem(); continue; }
       const info = withDb(db => ({
         title: sessionTitle(db, t.sess),
         label: lastPromptBefore(db, t.sess, Date.now()),
@@ -279,17 +302,30 @@ async function poll() {
       if (info.label) lines.push(`任务：${sanitize(info.label).slice(0, 40)}`);
       lines.push(`已运行：${formatDuration((Date.now() - t.started) / 1000)}后失联`);
       lines.push('（回合未正常结束，请回 ZCode 查看）');
-      await send(lines.join('\n'));
+      const r = await send(lines.join('\n'));
+      if (r === true) {
+        mem.notified[key] = 'aborted';
+        if (mem.sendFail) delete mem.sendFail[key];
+      } else if (r === 'nokey') {
+        mem.notified[key] = 'nokey';
+      } else {
+        mem.sendFail = mem.sendFail || {};
+        mem.sendFail[key] = fails + 1;
+      }
+      saveMem();
     }
   }
 
-  // 记忆清理：当日日志中已不见的回合（且非今日新增）逐出，防止无限增长
+  // 记忆清理：当日日志中已不见的回合逐出，防止无限增长
   for (const key of Object.keys(mem.notified)) {
     const tid = key.slice(0, key.lastIndexOf(':'));
     if (!turns[tid]) delete mem.notified[key];
   }
   for (const key of Object.keys(mem.lastSeen)) {
     if (!turns[key.slice(0, key.lastIndexOf(':'))]) delete mem.lastSeen[key];
+  }
+  for (const key of Object.keys(mem.sendFail || {})) {
+    if (!turns[key.slice(0, key.lastIndexOf(':'))]) delete mem.sendFail[key];
   }
   saveMem();
 }
@@ -299,6 +335,7 @@ async function main() {
   try { mem = JSON.parse(fs.readFileSync(MEM_FILE, 'utf8')); } catch { /* 首次运行 */ }
   mem.notified = mem.notified || {};   // 兼容旧版 memory 格式
   mem.lastSeen = mem.lastSeen || {};
+  mem.sendFail = mem.sendFail || {};
   await poll();
   saveMem();
 }
