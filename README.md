@@ -86,7 +86,8 @@ Key 解析优先级：环境变量 > `~/.qq-notify.json` > 插件 `config.json`�
 {
   "qmsgKey": "你的 Qmsg API Key",
   "thresholdSeconds": 60,
-  "stallMinutes": 5
+  "stallMinutes": 5,
+  "inFlightCapMinutes": 15
 }
 ```
 
@@ -96,6 +97,7 @@ Key 解析优先级：环境变量 > `~/.qq-notify.json` > 插件 `config.json`�
 |---|---|
 | `QQ_NOTIFY_THRESHOLD_SECONDS` | 通知阈值（秒），覆盖 `thresholdSeconds` |
 | `QQ_NOTIFY_STALL_MINUTES` | 失联阈值（分钟），覆盖 `stallMinutes` |
+| `QQ_NOTIFY_INFLIGHT_CAP_MINUTES` | 在途上限（分钟），覆盖 `inFlightCapMinutes` |
 | `QMSG_KEY` | Qmsg API Key，覆盖 `qmsgKey` |
 | `QQ_NOTIFY_DRY_RUN=1` | 只打印不发送，测试用 |
 
@@ -107,7 +109,7 @@ Key 解析优先级：环境变量 > `~/.qq-notify.json` > 插件 `config.json`�
 
 1. **计划任务（每分钟）** — 调起单次巡检 `watchdog.mjs`：扫描 ZCode 当日运行日志中的 `turn.started` / `turn.completed` 事件（回合生命周期在日志里有完整记录，与 hook 无关）
 2. **✅ 任务完成** — `turn.completed` 且时长 ≥ 阈值 → 通知。对话名、任务标签、AI 摘要从会话数据库（db.sqlite）读取
-3. **⚠️ 任务中断** — `turn.started` 后一直没等到完成、且该会话的日志沉默超过失联阈值（默认 5 分钟）→ 通知（每回合最多一次）
+3. **⚠️ 任务中断** — `turn.started` 后一直没等到完成、沉默超过失联阈值（默认 5 分钟）**且没有任何在途请求/工具** → 通知（每回合最多一次）。**长时间思考、板卡上跑长命令（在途状态）不会误报**；在途超过上限（默认 15 分钟，可调）才视为真失联
 4. **UserPromptSubmit hook** — 只负责一件事：确保计划任务已注册（自愈式：插件路径/版本变化时自动重建）
 
 巡检进程运行在 ZCode 之外（计划任务服务），不受会话结束影响。

@@ -58,6 +58,15 @@ function stallMs() {
   return 5 * 60000;
 }
 
+// 在途上限：思考/长工具在途的最长容忍时间，超过视为黑洞（真死）
+function inflightCapMs() {
+  const envV = Number(process.env.QQ_NOTIFY_INFLIGHT_CAP_MINUTES);
+  if (Number.isFinite(envV) && envV > 0) return envV * 60000;
+  const cfgV = Number(loadConfig().inFlightCapMinutes);
+  if (Number.isFinite(cfgV) && cfgV > 0) return cfgV * 60000;
+  return 15 * 60000;
+}
+
 function sanitize(text) {
   return String(text || '')
     .replace(/https?:\/\/\S+/g, '链接')
@@ -236,7 +245,7 @@ function saveMem() {
   try { fs.writeFileSync(MEM_FILE, JSON.stringify(mem)); } catch { /* 忽略 */ }
 }
 
-// 解析当日日志，聚合回合生命周期与本会话最后活动时间
+// 解析当日日志，聚合回合生命周期与回合内在途状态
 function scanLog() {
   const dt = new Date();
   const name = `zcode-${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}.jsonl`;
@@ -250,40 +259,45 @@ function scanLog() {
     fs.readSync(fd, buf, 0, size, st.size - size);
     fs.closeSync(fd);
     raw = buf.toString('utf8');
-  } catch { return { turns: {}, sessionLast: {} }; }
+  } catch { return { turns: {} }; }
 
-  const turns = {};        // turnId → { sess, started, completed, tools }
-  const sessionLast = {};  // sid → { ts: 最后一条日志的 UTC 毫秒, evt: 事件名 }
+  // turns: turnId → 回合聚合（生命周期 + 在途计数 + 最后事件）
+  const turns = {};
   for (const line of raw.split('\n')) {
     if (!line.startsWith('{')) continue;
     let j;
     try { j = JSON.parse(line); } catch { continue; }
-    const sid = j.sessionId || '';
-    const ts = Date.parse(j.timestamp || '');
-    if (sid && Number.isFinite(ts)) {
-      const cur = sessionLast[sid];
-      // 同毫秒事件按文件顺序后写优先
-      if (!cur || ts >= cur.ts) sessionLast[sid] = { ts, evt: String(j.event || j.message || '') };
-    }
-    if (j.event !== 'turn.started' && j.event !== 'turn.completed') continue;
     const tid = j.turnId || '';
     if (!tid) continue;
-    turns[tid] = turns[tid] || { sess: sid, started: 0, completed: 0, tools: 0 };
-    if (j.event === 'turn.started') {
-      turns[tid].sess = sid;
-      turns[tid].started = Date.parse(j.timestamp);
-    } else {
-      turns[tid].completed = Date.parse(j.timestamp);
-      turns[tid].tools = j.context?.toolCallCount ?? 0;
-    }
+    const ts = Date.parse(j.timestamp || '');
+    if (!Number.isFinite(ts)) continue;
+    const t = turns[tid] = turns[tid] || {
+      sess: j.sessionId || '', started: 0, completed: 0, tools: 0,
+      lastTs: 0, lastEvt: '', reqS: 0, reqC: 0, toolS: 0, toolC: 0,
+    };
+    if (ts >= t.lastTs) { t.lastTs = ts; t.lastEvt = String(j.event || j.message || ''); } // 同毫秒后写优先
+    if (j.event === 'turn.started') { t.sess = j.sessionId || t.sess; t.started = ts; }
+    else if (j.event === 'turn.completed') { t.completed = ts; t.tools = j.context?.toolCallCount ?? 0; }
+    else if (j.event === 'model.request.started') t.reqS++;
+    else if (j.event === 'model.request.completed') t.reqC++;
+    else if (j.event === 'tool.call.started') t.toolS++;
+    else if (j.event === 'tool.call.completed') t.toolC++;
   }
-  return { turns, sessionLast };
+  return { turns };
+}
+
+// 回合是否"有东西在途"（思考中/长工具执行中）——在途则永不判失联（受在途上限约束）
+function inFlight(t) {
+  if (t.reqS > t.reqC) return true;   // 有模型请求未返回（思考/生成中）
+  if (t.toolS > t.toolC) return true; // 有工具调用未返回（长命令执行中）
+  return /^(model\.request|tool\.call|model\.sdk\.stream)\.started$/.test(t.lastEvt);
 }
 
 async function poll() {
-  const { turns, sessionLast } = scanLog();
+  const { turns } = scanLog();
   const stall = stallMs();
   const th = thresholdSec();
+  const cap = inflightCapMs();
   const seenKeys = new Set();
 
   for (const [tid, t] of Object.entries(turns)) {
@@ -327,20 +341,13 @@ async function poll() {
       }
       saveMem();
     } else {
-      // —— 已开始未完成 → 会话日志沉默达到失联阈值则 ⚠️ ——
+      // —— 已开始未完成：区分"长时间思考/长工具执行"与"真失联" ——
       const st0 = mem.notified[key];
       if (st0 === 'aborted' || st0 === 'nokey' || st0 === 'failed') continue;
-      const act = sessionLast[t.sess];
-      const last = act ? act.ts : 0;
-      if (last > (mem.lastSeen[key] || 0)) {
-        mem.lastSeen[key] = last;
-        saveMem();
-      }
-      const seen = mem.lastSeen[key] || 0;
-      if (!seen) continue; // 会话在日志中查无活动，宁缺勿滥
-      if (Date.now() - seen < stall) continue; // 还活着
-      // 最后一条事件是请求/工具"开始"型 = 有东西在途（长工具调用、生成中），不算失联
-      if (act && /^(model\.request|tool\.call)\.started$/.test(act.evt)) continue;
+      if (!t.lastTs) continue; // 该回合在日志中无自身活动记录，宁缺勿滥
+      const silence = Date.now() - t.lastTs;
+      if (silence < stall) continue; // 最近仍有活动
+      if (inFlight(t) && silence < cap) continue; // 思考中/长工具在途：在途上限内不算失联
       if (!zcodeRunning()) continue; // 应用已关闭：不标记不报警，恢复后补报
       const fails = mem.sendFail?.[key] || 0;
       if (fails >= 3) { mem.notified[key] = 'failed'; saveMem(); continue; }
@@ -386,11 +393,15 @@ async function poll() {
 
 async function main() {
   fs.mkdirSync(ROOT, { recursive: true });
+  // 巡检互斥：仅当上一个巡检进程确实还活着（且未超10分钟）才跳过，避免每分钟节流
   try {
     const st = fs.statSync(RUN_LOCK);
-    if (Date.now() - st.mtimeMs < 180000) process.exit(0); // 上一次巡检仍在进行
-  } catch { /* 无锁，继续 */ }
-  fs.writeFileSync(RUN_LOCK, String(process.pid));
+    const pid = Number(fs.readFileSync(RUN_LOCK, 'utf8')) || 0;
+    let alive = false;
+    if (pid) { try { process.kill(pid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; } }
+    if (alive && Date.now() - st.mtimeMs < 600000) process.exit(0); // 真在跑
+  } catch { /* 无锁或锁损坏，继续 */ }
+  try { fs.writeFileSync(RUN_LOCK, String(process.pid)); } catch { /* 尽力而为 */ }
   try { mem = JSON.parse(fs.readFileSync(MEM_FILE, 'utf8')); } catch { /* 首次运行 */ }
   mem.notified = mem.notified || {};   // 兼容旧版 memory 格式
   mem.lastSeen = mem.lastSeen || {};
