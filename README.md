@@ -87,7 +87,9 @@ Key 解析优先级：环境变量 > `~/.qq-notify.json` > 插件 `config.json`�
   "qmsgKey": "你的 Qmsg API Key",
   "thresholdSeconds": 60,
   "stallMinutes": 5,
-  "inFlightCapMinutes": 15
+  "inFlightCapMinutes": 30,
+  "reqCapMinutes": 60,
+  "backlogMinutes": 30
 }
 ```
 
@@ -97,7 +99,9 @@ Key 解析优先级：环境变量 > `~/.qq-notify.json` > 插件 `config.json`�
 |---|---|
 | `QQ_NOTIFY_THRESHOLD_SECONDS` | 通知阈值（秒），覆盖 `thresholdSeconds` |
 | `QQ_NOTIFY_STALL_MINUTES` | 失联阈值（分钟），覆盖 `stallMinutes` |
-| `QQ_NOTIFY_INFLIGHT_CAP_MINUTES` | 在途上限（分钟），覆盖 `inFlightCapMinutes` |
+| `QQ_NOTIFY_INFLIGHT_CAP_MINUTES` | 工具在途上限（分钟），覆盖 `inFlightCapMinutes` |
+| `QQ_NOTIFY_REQ_CAP_MINUTES` | 请求在途兜底上限（分钟），覆盖 `reqCapMinutes` |
+| `QQ_NOTIFY_BACKLOG_MINUTES` | 积压截断（分钟），覆盖 `backlogMinutes` |
 | `QMSG_KEY` | Qmsg API Key，覆盖 `qmsgKey` |
 | `QQ_NOTIFY_DRY_RUN=1` | 只打印不发送，测试用 |
 

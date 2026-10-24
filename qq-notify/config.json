@@ -2,5 +2,7 @@
   "qmsgKey": "",
   "thresholdSeconds": 60,
   "stallMinutes": 5,
-  "inFlightCapMinutes": 30
+  "inFlightCapMinutes": 30,
+  "backlogMinutes": 30,
+  "reqCapMinutes": 60
 }
