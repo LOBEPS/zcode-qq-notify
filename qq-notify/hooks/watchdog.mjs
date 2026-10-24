@@ -364,7 +364,7 @@ async function doctor() {
     }
   });
 
-  console.log('\nqq-notify 自诊断（v1.1.0）');
+  console.log('\nqq-notify 自诊断（v1.1.1）');
   console.log('═'.repeat(64));
   for (const r of R) {
     const flag = r.ok ? (r.warn ? '⚠️ ' : '✅') : '❌';
