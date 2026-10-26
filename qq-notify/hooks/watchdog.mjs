@@ -179,7 +179,7 @@ function withDb(fn) {
   finally { try { db?.close(); } catch { /* 忽略 */ } }
 }
 
-const TERMINAL = ['done', 'skip', 'failed', 'nokey', 'aborted', 'sent'];
+const TERMINAL = ['done', 'skip', 'failed', 'nokey', 'aborted', 'sent', 'stopped'];
 
 async function poll() {
   const turns = scanLog();
@@ -262,6 +262,16 @@ async function poll() {
       // ④ 工具在途（长命令）→ 黑洞上限（默认30分钟）内不报
       // ⑤ 无在途 + 沉默超失联阈值（默认5分钟）→ 报警
       if (!t.lastTs) continue;
+      // 权威状态核对（turn_usage 表）：手动停止与自然失败在日志里都记 turn.failed，只有数据库能区分
+      const tu = withDb(db => (db ? ZC.dbTurnStatus(db, tid) : null));
+      if (tu?.cancelled) {
+        log(`用户手动停止，静默终结: ${tid.slice(5, 13)}`);
+        mem.notified[key] = 'stopped'; saveMem(); continue;
+      }
+      if (tu?.status === 'completed') {
+        // 数据库说已完成但日志缺 turn.completed（极端边缘）：不报警
+        mem.notified[key] = 'skip'; saveMem(); continue;
+      }
       const silence = Date.now() - t.lastTs;
       const failFresh = t.failTs && t.failTs >= t.lastTs && (Date.now() - t.failTs) >= FAIL_GRACE_MS;
       const superseded = latestBySess[t.sess] > (t.started || 0);

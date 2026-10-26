@@ -95,6 +95,19 @@ export function dbSessionTitle(db, sid) {
   } catch { return ''; }
 }
 
+// 回合权威状态（turn_usage 表）：手动停止(cancelled)与自然失败(error)的唯一区分来源。
+// 日志里两者都记 turn.failed 无法区分，必须查库。
+export function dbTurnStatus(db, tid) {
+  try {
+    const r = db.prepare('SELECT status, cancelled_by_user FROM turn_usage WHERE turn_id = ?').get(tid);
+    if (!r) return null;
+    return {
+      status: String(r.status || ''),
+      cancelled: r.status === 'cancelled' || !!r.cancelled_by_user,
+    };
+  } catch { return null; }
+}
+
 export function dbLastPrompt(db, sid, ts) {
   try {
     const r = db.prepare(

@@ -21,7 +21,7 @@ node ~/.qq-notify/watchdog.mjs --doctor
 | COMPAT-3 | 事件名 | `turn.started` / `turn.completed` / `model.request.started` / `model.request.completed` / `tool.call.started` / `tool.call.completed` | `EVENTS` 表 | 日志有内容但 0 个回合被识别（完成/中断通知全部消失） | 在对应数组追加新事件名（旧名保留兼容） |
 | COMPAT-4 | 日志行字段 | `timestamp`(ISO) / `sessionId` / `turnId` / `context.toolCallCount` | `extract*` 函数组 | 回合识别异常（时长/会话错乱） | 在 extract 函数追加字段别名 |
 | COMPAT-5 | 数据库位置 | `<根>/db/db.sqlite` | `findDbPath` | 通知缺少"对话/任务/摘要"行 | 追加路径候选 |
-| COMPAT-6 | 数据库表结构 | `session(id,title)` / `input_history(session_id,text,time_created)` / `message(session_id,data,sequence)`，data 含 `{role,text|parts,time}` | `dbSessionTitle` / `dbLastPrompt` / `dbLastAssistantText` | 通知缺少素材行（发送不受影响，静默降级） | 修改对应查询与解析 |
+| COMPAT-6 | 数据库表结构 | `session(id,title)` / `input_history(session_id,text,time_created)` / `message(session_id,data,sequence)`（data 含 `{role,text|parts,time}`）/ `turn_usage(turn_id,status,cancelled_by_user)` | `dbSessionTitle` / `dbLastPrompt` / `dbLastAssistantText` / `dbTurnStatus` | 通知缺少素材行（发送不受影响，静默降级）；**手动停止将与自然失败无法区分（手动停止也会报警）** | 修改对应查询与解析 |
 | COMPAT-7 | 进程名 | `ZCode.exe` | `PROCESS_PATTERNS` | ⚠️ 中断报警被抑制（完成通知不受影响） | 追加进程名正则 |
 
 ## 不属于 ZCode 依赖的部分（不会被 ZCode 更新破坏）
