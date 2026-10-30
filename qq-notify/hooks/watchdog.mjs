@@ -23,7 +23,7 @@ import * as ZC from './zcode-adapter.mjs';
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const USER_DIR = path.join(os.homedir(), '.qq-notify');
 const OP_LOG = path.join(USER_DIR, 'watchdog.log');
-const ROOT = path.join(os.tmpdir(), 'qq-notify-watchdog');
+const ROOT = process.env.QQ_NOTIFY_STATE_ROOT || path.join(os.tmpdir(), 'qq-notify-watchdog');
 const MEM_FILE = path.join(ROOT, 'memory.json');
 const RUN_LOCK = path.join(ROOT, 'run.lock');
 const TAIL_BYTES = 8 * 1024 * 1024;  // 单个日志文件最大读取范围
@@ -57,8 +57,9 @@ function settings() {
     key: process.env.QMSG_KEY || user.qmsgKey || '',
     thresholdSec: num(process.env.QQ_NOTIFY_THRESHOLD_SECONDS) ?? num(user.thresholdSeconds) ?? 600,
     stallMs: (num(process.env.QQ_NOTIFY_STALL_MINUTES) ?? num(user.stallMinutes) ?? 5) * 60000,
+    stallPolls: num(process.env.QQ_NOTIFY_STALL_MINUTES) ?? num(user.stallMinutes) ?? 5,
     capMs: (num(process.env.QQ_NOTIFY_INFLIGHT_CAP_MINUTES) ?? num(user.inFlightCapMinutes) ?? 30) * 60000, // 工具黑洞上限
-    reqCapMs: (num(process.env.QQ_NOTIFY_REQ_CAP_MINUTES) ?? num(user.reqCapMinutes) ?? 60) * 60000,        // 请求孤儿兜底上限
+    capPolls: num(process.env.QQ_NOTIFY_INFLIGHT_CAP_MINUTES) ?? num(user.inFlightCapMinutes) ?? 30,
     backlogMs: (num(process.env.QQ_NOTIFY_BACKLOG_MINUTES) ?? num(user.backlogMinutes) ?? 30) * 60000,      // 积压截断
   };
 }
@@ -123,47 +124,85 @@ function touchRunLock() {
   }
 }
 
-// ── 日志扫描（今天 + 昨天，事件名/字段经适配层）──
+// ── 日志扫描（全保留期 + 磁盘解析缓存：每文件只在变化时重解析）──
+// 长寿命回合（SSH 会话的数天长任务）的 turn.started 在数天前的日志里，
+// 只扫今天+昨天会漏掉它们的完成通知（v1.2.x 时代 SSH 会话失效的终极根因）。
+const SCAN_CACHE = path.join(USER_DIR, 'scan-cache.json');
+function loadScanCache() {
+  try { return JSON.parse(fs.readFileSync(SCAN_CACHE, 'utf8')); } catch { return {}; }
+}
+function saveScanCache(c) {
+  try { fs.writeFileSync(SCAN_CACHE, JSON.stringify(c)); } catch { /* 忽略 */ }
+}
+
 function scanLog() {
+  const cache = loadScanCache();
   const turns = {};
-  for (const p of ZC.logFilePaths()) {
-    let raw = '';
-    try {
-      const st = fs.statSync(p);
-      const size = Math.min(st.size, TAIL_BYTES);
-      const buf = Buffer.alloc(size);
-      const fd = fs.openSync(p, 'r');
-      fs.readSync(fd, buf, 0, size, st.size - size);
-      fs.closeSync(fd);
-      raw = buf.toString('utf8');
-    } catch { continue; }
-    for (const line of raw.split('\n')) {
-      if (!line.startsWith('{')) continue;
-      let j;
-      try { j = JSON.parse(line); } catch { continue; }
-      const tid = ZC.extractTurnId(j);
-      if (!tid) continue;
-      const ts = ZC.extractTimestamp(j);
-      if (!Number.isFinite(ts)) continue;
-      const kind = ZC.eventKind(j.event || '');
-      // 错误事件（level:error，无 event 字段但有 message）必须放行——它是回合失败的判定信号
-      if (!kind && !j.event && !j.message) continue;
-      const t = turns[tid] = turns[tid] || {
-        sess: ZC.extractSessionId(j), started: 0, completed: 0, tools: 0,
-        lastTs: 0, lastEvt: '', reqS: 0, reqC: 0, toolS: 0, toolC: 0, failTs: 0,
-      };
-      if (ZC.extractSessionId(j)) t.sess = ZC.extractSessionId(j);
-      if (ts >= t.lastTs) { t.lastTs = ts; t.lastEvt = String(j.event || j.message || ''); }
-      if (kind === 'turnStarted') t.started = ts;
-      else if (kind === 'turnCompleted') { t.completed = ts; t.tools = ZC.extractToolCount(j); }
-      else if (kind === 'reqStarted') t.reqS++;
-      else if (kind === 'reqCompleted') t.reqC++;
-      else if (kind === 'toolStarted') t.toolS++;
-      else if (kind === 'toolCompleted') t.toolC++;
-      // 回合失败信号（SDK 重试穷尽后 ZCode 记录的错误事件，带 turnId）
-      if (j.level === 'error' && /Turn failed|stream failed/i.test(String(j.message || ''))) t.failTs = ts;
+  const files = ZC.logFilePaths();
+  const seen = new Set();
+  for (const p of files) {
+    seen.add(p);
+    let st;
+    try { st = fs.statSync(p); } catch { continue; }
+    const sig = `${st.mtimeMs}:${st.size}`;
+    let fileTurns = (cache[p] && cache[p].sig === sig) ? cache[p].turns : null;
+    if (!fileTurns) {
+      fileTurns = {};
+      let raw = '';
+      try {
+        const size = Math.min(st.size, TAIL_BYTES);
+        const buf = Buffer.alloc(size);
+        const fd = fs.openSync(p, 'r');
+        fs.readSync(fd, buf, 0, size, st.size - size);
+        fs.closeSync(fd);
+        raw = buf.toString('utf8');
+      } catch { continue; }
+      for (const line of raw.split('\n')) {
+        if (!line.startsWith('{')) continue;
+        let j;
+        try { j = JSON.parse(line); } catch { continue; }
+        const tid = ZC.extractTurnId(j);
+        if (!tid) continue;
+        const ts = ZC.extractTimestamp(j);
+        if (!Number.isFinite(ts)) continue;
+        const kind = ZC.eventKind(j.event || '');
+        // 错误事件（level:error，无 event 字段但有 message）必须放行——它是回合失败的判定信号
+        if (!kind && !j.event && !j.message) continue;
+        const t = fileTurns[tid] = fileTurns[tid] || {
+          sess: ZC.extractSessionId(j), started: 0, completed: 0, tools: 0,
+          lastTs: 0, lastEvt: '', reqS: 0, reqC: 0, toolS: 0, toolC: 0, failTs: 0, evtCount: 0,
+        };
+        t.evtCount++; // 全事件计数（含 persistence 影子）——跨巡检的活动性信号，时钟跳变免疫
+        if (ZC.extractSessionId(j)) t.sess = ZC.extractSessionId(j);
+        if (ts >= t.lastTs) { t.lastTs = ts; t.lastEvt = String(j.event || j.message || ''); }
+        if (kind === 'turnStarted') t.started = ts;
+        else if (kind === 'turnCompleted') { t.completed = ts; t.tools = ZC.extractToolCount(j); }
+        else if (kind === 'reqStarted') t.reqS++;
+        else if (kind === 'reqCompleted') t.reqC++;
+        else if (kind === 'toolStarted') t.toolS++;
+        else if (kind === 'toolCompleted') t.toolC++;
+        // 回合失败信号（SDK 重试穷尽后 ZCode 记录的错误事件，带 turnId）
+        if (j.level === 'error' && /Turn failed|stream failed/i.test(String(j.message || ''))) t.failTs = ts;
+      }
+      cache[p] = { sig, turns: fileTurns };
+    }
+    // 合并到全局回合视图（跨文件聚合：最早 started、最新 completed/lastTs、计数求和）
+    for (const [tid, ft] of Object.entries(fileTurns)) {
+      const t = turns[tid] = turns[tid] || { ...ft, reqS: 0, reqC: 0, toolS: 0, toolC: 0, evtCount: 0 };
+      if (t.sess === '' ) t.sess = ft.sess;
+      if (ft.started && (!t.started || ft.started < t.started)) t.started = ft.started;
+      if (ft.completed && (!t.completed || ft.completed > t.completed)) { t.completed = ft.completed; t.tools = ft.tools; }
+      t.reqS += ft.reqS; t.reqC += ft.reqC; t.toolS += ft.toolS; t.toolC += ft.toolC;
+      t.evtCount += ft.evtCount;
+      if (ft.lastTs > t.lastTs) { t.lastTs = ft.lastTs; t.lastEvt = ft.lastEvt; }
+      if (ft.failTs > (t.failTs || 0)) t.failTs = ft.failTs;
     }
   }
+  // 逐出已删除文件的缓存
+  for (const p of Object.keys(cache)) {
+    if (!seen.has(p)) delete cache[p];
+  }
+  saveScanCache(cache);
   return turns;
 }
 
@@ -184,8 +223,13 @@ const TERMINAL = ['done', 'skip', 'failed', 'nokey', 'aborted', 'sent', 'stopped
 async function poll() {
   const turns = scanLog();
   const cfg = settings();
+  // 巡检节奏 = 计划任务的 1 分钟；阈值按"巡检次数"计（时钟跳变免疫）
+  const stallPolls = Math.max(1, Math.round(cfg.stallMs / 60000));
+  const capPolls = Math.max(1, Math.round(cfg.capMs / 60000));
+  const reqCapPolls = Math.max(1, Math.round(cfg.reqCapMs / 60000));
   const dbg = process.env.QQ_NOTIFY_DEBUG === '1';
-  if (dbg) log(`巡检: 回合数=${Object.keys(turns).length} 阈值=${cfg.thresholdSec}s 失联=${cfg.stallMs / 60000}分 工具上限=${cfg.capMs / 60000}分 请求兜底=${cfg.reqCapMs / 60000}分 积压截断=${cfg.backlogMs / 60000}分`);
+  const seen = new Set();
+  if (dbg) log(`巡检: 回合数=${Object.keys(turns).length} 阈值=${cfg.thresholdSec}s 失联=${cfg.stallMs / 60000}分 工具上限=${cfg.capMs / 60000}分 积压截断=${cfg.backlogMs / 60000}分（均按 1 分钟巡检节奏折算）`);
 
   // 按时间倒序：最新完成的先通知（降低新鲜通知延迟）
   const list = Object.entries(turns).sort((a, b) =>
@@ -218,6 +262,7 @@ async function poll() {
       if (!r.ok || !r.msgId) throw new Error('发送被拒绝');
       mem.notified[memKey] = 'sent'; // 先落账防双发；回执阶段定稿
       receipts.push({ msgId: r.msgId, sentAt: lastSendAt, kind, text, fallbackText, memKey });
+      log(`发送 ${kind} msgId=${r.msgId}`);
     } catch (e) {
       log(`发送失败 ${memKey.slice(0, 24)}… ${e?.message || e}`);
       mem.sendFail = mem.sendFail || {};
@@ -229,6 +274,7 @@ async function poll() {
   for (const [tid, t] of list) {
     if (!t.sess) continue;
     const key = `${tid}:${t.sess.slice(5, 13)}`;
+    seen.add(key);
     if (TERMINAL.includes(mem.notified[key])) continue;
 
     if (t.completed) {
@@ -272,20 +318,34 @@ async function poll() {
         // 数据库说已完成但日志缺 turn.completed（极端边缘）：不报警
         mem.notified[key] = 'skip'; saveMem(); continue;
       }
-      const silence = Date.now() - t.lastTs;
+      const silence = Date.now() - t.lastTs; // 仅用于展示；判定用巡检计数（时钟跳变免疫）
       const failFresh = t.failTs && t.failTs >= t.lastTs && (Date.now() - t.failTs) >= FAIL_GRACE_MS;
       const superseded = latestBySess[t.sess] > (t.started || 0);
       const inFlightReq = t.reqS > t.reqC;
       const inFlightTool = t.toolS > t.toolC;
-      if (dbg) log(`评估 ${tid.slice(5, 13)}: silence=${Math.round(silence / 1000)}s req=${t.reqS}/${t.reqC} tool=${t.toolS}/${t.toolC} lastEvt=${t.lastEvt.slice(0, 24)} failFresh=${!!failFresh} superseded=${superseded} think=${inFlightReq} toolInFlight=${inFlightTool}`);
+      // 活动性改用巡检计数（stagnation）：事件总数跨巡检不变 = 失联；对时钟跳变免疫
+      const watch = mem.turnWatch?.[key] || { ec: t.evtCount, stagnant: 0 };
+      const stagnant = (watch.ec === t.evtCount) ? (watch.stagnant || 0) + 1 : 0;
+      mem.turnWatch = mem.turnWatch || {};
+      mem.turnWatch[key] = { ec: t.evtCount, stagnant };
+      if (dbg) log(`评估 ${tid.slice(5, 13)}: evtCount=${t.evtCount} stagnant=${stagnant}/${cfg.stallPolls} req=${t.reqS}/${t.reqC} tool=${t.toolS}/${t.toolC} lastEvt=${t.lastEvt.slice(0, 24)} failFresh=${!!failFresh} superseded=${superseded} think=${inFlightReq} toolInFlight=${inFlightTool}`);
       if (superseded && !failFresh) {
         log(`回合被取代，静默终结: ${tid.slice(5, 13)}`);
         mem.notified[key] = 'aborted'; saveMem(); continue;
       }
       if (!failFresh) {
-        if (silence < cfg.stallMs) continue;
-        if (inFlightReq && silence < cfg.reqCapMs) continue;
-        if (inFlightTool && silence < cfg.capMs) continue;
+        if (inFlightReq) continue;                               // 思考/生成中：永不误报（SDK 超时与失败事件会给终态）
+        if (inFlightTool && stagnant < capPolls) continue;       // 长工具在途（黑洞上限，按巡检次数计）
+        if (inFlightTool) {                                      // 工具在途超上限：黑洞 → 报警
+          if (dbg) log(`工具黑洞（在途 ${stagnant} 次巡检）→ 报警`);
+        } else {
+          if (stagnant < stallPolls) continue;                   // 无在途：未达失联巡检数
+          // 古老回合：开始已超积压窗口的未完成回合，此时报警只是迟到噪音
+          if (t.started && Date.now() - t.started > cfg.backlogMs) {
+            log(`古老回合，静默终结: ${tid.slice(5, 13)}（开始于 ${Math.round((Date.now() - t.started) / 60000)} 分钟前）`);
+            mem.notified[key] = 'skip'; saveMem(); continue;
+          }
+        }
       }
       if (!ZC.zcodeProcessRunning(execSync)) continue; // 应用已关闭：不报警，恢复后补报
       const info = withDb(db => ({
@@ -337,6 +397,18 @@ async function poll() {
     }
     saveMem();
   }
+
+  // 记忆清理：日志中已不见的回合逐出（防止账本无限增长）
+  for (const key of Object.keys(mem.notified)) {
+    if (!seen.has(key)) delete mem.notified[key];
+  }
+  for (const key of Object.keys(mem.sendFail || {})) {
+    if (!seen.has(key)) delete mem.sendFail[key];
+  }
+  for (const key of Object.keys(mem.turnWatch || {})) {
+    if (!seen.has(key)) delete mem.turnWatch[key];
+  }
+  saveMem();
 }
 
 // ── 自诊断：ZCode 更新导致失效时，运行 --doctor 精确定位 ──
@@ -430,6 +502,7 @@ async function main() {
   mem.notified = mem.notified || {};
   mem.lastSeen = mem.lastSeen || {};
   mem.sendFail = mem.sendFail || {};
+  mem.turnWatch = mem.turnWatch || {};
   await poll();
   saveMem();
 }

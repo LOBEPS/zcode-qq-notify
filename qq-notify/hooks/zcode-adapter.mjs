@@ -40,15 +40,12 @@ export function findLogDir() {
 export function logFilePaths() {
   const dir = findLogDir();
   if (!dir) return [];
-  const out = [];
-  // 今天 + 昨天：跨午夜的回合其 started 事件记在昨日日志
-  for (const off of [0, 86400000]) {
-    const dt = new Date(Date.now() - off);
-    const name = `zcode-${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}.jsonl`;
-    const p = path.join(dir, name);
-    if (fs.existsSync(p)) out.push(p);
-  }
-  return out;
+  // 全保留期扫描：今天+昨天+更早。长寿命回合（SSH 会话的数天长任务）的
+  // turn.started 事件可能在数天前的日志里——只扫两天会漏掉它们的完成通知。
+  const names = fs.readdirSync(dir)
+    .filter(f => /^zcode-\d{4}-\d{2}-\d{2}\.jsonl$/.test(f))
+    .sort();
+  return names.map(name => path.join(dir, name));
 }
 
 // [COMPAT-3] 事件名契约。ZCode 重命名事件时，在对应数组里追加新名即可。
